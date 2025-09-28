@@ -1,0 +1,181 @@
+# Elixir + DuckDB + Iceberg
+
+```elixir
+Mix.install([
+  {:explorer, "~> 0.11.1"},
+  {:adbc, github: "elixir-explorer/adbc", ref: "8e44fc402627dd0c4c6077c24df27cf8a97654cd", override: true},
+  {:kino, "~> 0.17.0"},
+  {:kino_explorer, "~> 0.1.25"},
+  {:kino_vega_lite, "~> 0.1.13"},
+])
+```
+
+## Connect to DuckDB
+
+```elixir
+# Change URL for your architecture: https://github.com/duckdb/duckdb/releases/tag/v1.4.0
+Adbc.download_driver!(:duckdb, version: "1.4.0", url: "https://github.com/duckdb/duckdb/releases/download/v1.4.0/libduckdb-linux-arm64.zip", force: true)
+
+{:ok, db} = Kino.start_child({Adbc.Database, driver: :duckdb, version: "1.4.0"})
+{:ok, conn} = Kino.start_child({Adbc.Connection, database: db})
+```
+
+## Load Extensions
+
+```elixir
+Adbc.Connection.query!(conn, "INSTALL iceberg;")
+Adbc.Connection.query!(conn, "INSTALL httpfs;")
+Adbc.Connection.query!(conn, "UPDATE extensions;")
+Adbc.Connection.query!(conn, "LOAD iceberg;")
+Adbc.Connection.query!(conn, "LOAD httpfs;")
+```
+
+## Attach Catalog
+
+```elixir
+iceberg_catalog = """
+attach 'demo' as my_datalake (
+	type ICEBERG,
+	ENDPOINT 'http://lakekeeper:8181/catalog',
+	TOKEN ''
+)
+"""
+
+Adbc.Connection.query!(conn, iceberg_catalog)
+```
+
+## Create Tables
+
+```elixir
+alias Explorer.DataFrame, as: DF
+
+Adbc.Connection.query!(conn, "CREATE SCHEMA IF NOT EXISTS my_datalake.ecommerce;")
+
+products_table = """
+CREATE TABLE IF NOT EXISTS my_datalake.ecommerce.products (
+    id INTEGER,
+    name STRING,
+    category STRING,
+    price DOUBLE,
+    stock_quantity INTEGER,
+    created_at DATE
+);
+"""
+Adbc.Connection.query!(conn, products_table)
+
+orders_table = """
+CREATE TABLE IF NOT EXISTS my_datalake.ecommerce.orders (
+    id INTEGER,
+    product_id INTEGER,
+    customer_name STRING,
+    quantity INTEGER,
+    total_amount DOUBLE,
+    order_date DATE,
+    status STRING
+);
+"""
+Adbc.Connection.query!(conn, orders_table)
+```
+
+## Add Sample Data
+
+```elixir
+products_data = """
+INSERT INTO my_datalake.ecommerce.products VALUES
+(1, 'Smartphone Pro', 'Electronics', 899.99, 50, '2024-01-15'),
+(2, 'Wireless Headphones', 'Electronics', 199.99, 100, '2024-01-16'),
+(3, 'Cotton T-Shirt', 'Clothing', 29.99, 200, '2024-01-17'),
+(4, 'Coffee Maker', 'Home & Kitchen', 149.99, 75, '2024-01-18'),
+(5, 'Running Shoes', 'Sports', 129.99, 80, '2024-01-19'),
+(6, 'Laptop Stand', 'Electronics', 79.99, 120, '2024-01-20'),
+(7, 'Yoga Mat', 'Sports', 39.99, 150, '2024-01-21'),
+(8, 'Ceramic Mug', 'Home & Kitchen', 19.99, 300, '2024-01-22');
+"""
+Adbc.Connection.query!(conn, products_data)
+
+orders_data = """
+INSERT INTO my_datalake.ecommerce.orders VALUES
+(1, 1, 'Anna Smith', 1, 899.99, '2024-02-01', 'completed'),
+(2, 2, 'John Johnson', 2, 399.98, '2024-02-02', 'completed'),
+(3, 3, 'Mary Williams', 3, 89.97, '2024-02-03', 'shipped'),
+(4, 4, 'Charles Brown', 1, 149.99, '2024-02-04', 'completed'),
+(5, 5, 'Lucy Davis', 1, 129.99, '2024-02-05', 'processing'),
+(6, 1, 'Peter Miller', 1, 899.99, '2024-02-06', 'completed'),
+(7, 6, 'Sophia Wilson', 2, 159.98, '2024-02-07', 'shipped'),
+(8, 7, 'Michael Moore', 1, 39.99, '2024-02-08', 'completed'),
+(9, 8, 'Rita Taylor', 4, 79.96, '2024-02-09', 'completed'),
+(10, 2, 'James Anderson', 1, 199.99, '2024-02-10', 'processing');
+"""
+Adbc.Connection.query!(conn, orders_data)
+```
+
+## Query Data
+
+```elixir
+products_df = DF.from_query!(conn, "SELECT * FROM my_datalake.ecommerce.products ORDER BY id;", [])
+products_df
+```
+
+```elixir
+orders_df = DF.from_query!(conn, "SELECT * FROM my_datalake.ecommerce.orders ORDER BY id;", [])
+orders_df
+```
+
+```elixir
+order_details_query = """
+SELECT
+    o.id as order_id,
+    o.customer_name,
+    p.name as product_name,
+    p.category,
+    o.quantity,
+    p.price as unit_price,
+    o.total_amount,
+    o.order_date,
+    o.status
+FROM my_datalake.ecommerce.orders o
+JOIN my_datalake.ecommerce.products p ON o.product_id = p.id
+ORDER BY o.order_date DESC;
+"""
+
+order_details_df = DF.from_query!(conn, order_details_query, [])
+order_details_df
+```
+
+## Visualize Data
+
+```elixir
+sales_by_category_query = """
+SELECT
+    p.category,
+    SUM(o.total_amount) as total_revenue
+FROM my_datalake.ecommerce.orders o
+JOIN my_datalake.ecommerce.products p ON o.product_id = p.id
+WHERE o.status = 'completed'
+GROUP BY p.category
+ORDER BY total_revenue DESC;
+"""
+
+sales_data = DF.from_query!(conn, sales_by_category_query, [])
+|> DF.to_rows(atom_keys: true)
+
+alias VegaLite, as: Vl
+
+Vl.new(width: 500, height: 300)
+|> Vl.data_from_values(sales_data)
+|> Vl.mark(:bar, color: "#4f81bd")
+|> Vl.encode_field(:x, "category", type: :nominal, title: "Product Category")
+|> Vl.encode_field(:y, "total_revenue", type: :quantitative, title: "Total Revenue ($)")
+|> Vl.config(axis: %{labelFontSize: 12, titleFontSize: 14})
+```
+
+```elixir
+product_data = products_df |> DF.to_rows(atom_keys: true)
+
+Vl.new(width: 500, height: 350)
+|> Vl.data_from_values(product_data)
+|> Vl.mark(:circle, size: 100, opacity: 0.7)
+|> Vl.encode_field(:x, "price", type: :quantitative, title: "Price ($)")
+|> Vl.encode_field(:y, "stock_quantity", type: :quantitative, title: "Stock Quantity")
+|> Vl.encode_field(:color, "category", type: :nominal, title: "Category")
+```
